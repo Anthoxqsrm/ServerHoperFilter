@@ -1,0 +1,813 @@
+-- Hopper Script PRO para Steal A Brainrot (Versión final)
+-- Busca Brainrots individuales de 50M/s o más
+-- Incluye: fixes, anti-duplicados, búsqueda real de servidores, skip vacíos,
+-- modo sigiloso (floating), auto-join al mejor, reintentos de teleport y UI optimizada.
+
+-- Nota: este script asume que tu executor/entorno permite HttpGet y TeleportToPlaceInstance.
+-- Ajusta los valores de configuración al inicio si quieres cambiar filtros/comportamiento.
+
+print("🚀 INICIANDO HOPPER SCRIPT PRO (FINAL)")
+
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+
+local player = Players.LocalPlayer
+if not player then
+    error("Este script debe ejecutarse en un LocalScript o en un entorno donde LocalPlayer exista.")
+end
+
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- =========================
+-- CONFIGURACIÓN (ajustables)
+-- =========================
+local PLACE_ID = game.PlaceId
+local MIN_GENERATION_PER_BRAINROT = 50 * 1000000 -- 50M por Brainrot individual (filtro mínimo)
+local MAX_GENERATION_FILTER = 5 * 1000000000 -- 5B por defecto (puedes poner math.huge para desactivar)
+local SCAN_WAIT_SECONDS = 6 -- espera tras teleport antes de escanear
+local isExploring = false
+local goodBrainrots = {}        -- lista global de Brainrots encontrados (sin duplicados)
+local visitedServers = {}      -- map para evitar re-explorar servidores
+local serverSkipThresholdPlayers = 2 -- no teleports a servers con menos de X players
+local serversToTryLimit = 200  -- limite total de servidores a recolectar (paginado)
+local displayResultsLimit = 30 -- limite de resultados a mostrar en UI para no causar lag
+local autoJoinBest = false     -- si true, intenta unirte automáticamente al mejor
+local autoRetryTeleport = true -- reintentar teleport si falla
+local teleportRetryCount = 3
+local teleportRetryDelay = 1.5 -- segundos entre reintentos
+local throttleHttpSeconds = 1.0 -- espera mínima entre requests a la API
+local lastHttpRequest = 0
+
+-- =========================
+-- UTILIDADES
+-- =========================
+local function addCorner(parent, radius)
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, radius)
+    corner.Parent = parent
+end
+
+local function formatNumber(num)
+    num = tonumber(num) or 0
+    if num >= 1000000000 then
+        return string.format("$%.1fB", num / 1000000000)
+    elseif num >= 1000000 then
+        return string.format("$%.1fM", num / 1000000)
+    elseif num >= 1000 then
+        return string.format("$%.1fK", num / 1000)
+    else
+        return "$" .. tostring(math.floor(num))
+    end
+end
+
+local function hopperLog(title, lines)
+    print("\n" .. string.rep("=", 28))
+    print("=== HOPPER PRO: " .. tostring(title) .. " ===")
+    for _, v in ipairs(lines or {}) do
+        print(" - " .. tostring(v))
+    end
+    print(string.rep("=", 28) .. "\n")
+end
+
+-- =========================
+-- CREAR / RECREAR GUI
+-- =========================
+local existing = playerGui:FindFirstChild("HopperGui")
+if existing then existing:Destroy() end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "HopperGui"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 999999
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = playerGui
+
+-- Main frame
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.new(0, 520, 0, 620)
+mainFrame.Position = UDim2.new(0.5, -260, 0.5, -310)
+mainFrame.BackgroundColor3 = Color3.fromRGB(25, 35, 50)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+addCorner(mainFrame, 12)
+
+-- Top bar
+local topBar = Instance.new("Frame")
+topBar.Size = UDim2.new(1, 0, 0, 54)
+topBar.BackgroundColor3 = Color3.fromRGB(35, 45, 65)
+topBar.BorderSizePixel = 0
+topBar.Parent = mainFrame
+addCorner(topBar, 12)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -120, 1, 0)
+title.Position = UDim2.new(0, 16, 0, 0)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 18
+title.TextColor3 = Color3.fromRGB(255,255,255)
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Text = "🤖 HOPPER PRO - Bot Explorador"
+title.Parent = topBar
+
+-- Minimize and close
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Size = UDim2.new(0, 40, 0, 40)
+minimizeBtn.Position = UDim2.new(1, -100, 0, 7)
+minimizeBtn.BackgroundColor3 = Color3.fromRGB(255,200,50)
+minimizeBtn.Text = "—"
+minimizeBtn.Font = Enum.Font.GothamBold
+minimizeBtn.TextSize = 22
+minimizeBtn.Parent = topBar
+addCorner(minimizeBtn, 8)
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 40, 0, 40)
+closeBtn.Position = UDim2.new(1, -50, 0, 7)
+closeBtn.BackgroundColor3 = Color3.fromRGB(220,50,50)
+closeBtn.Text = "✕"
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 18
+closeBtn.TextColor3 = Color3.fromRGB(255,255,255)
+closeBtn.Parent = topBar
+addCorner(closeBtn, 8)
+
+-- Floating circle (sigiloso)
+local floatingCircle = Instance.new("Frame")
+floatingCircle.Name = "FloatingCircle"
+floatingCircle.Size = UDim2.new(0, 70, 0, 70)
+floatingCircle.Position = UDim2.new(1, -90, 0.5, -35)
+floatingCircle.BackgroundColor3 = Color3.fromRGB(50,150,250)
+floatingCircle.BorderSizePixel = 0
+floatingCircle.Active = true
+floatingCircle.Draggable = true
+floatingCircle.Visible = false
+floatingCircle.Parent = screenGui
+addCorner(floatingCircle, 35)
+
+local circleBtn = Instance.new("TextButton")
+circleBtn.Size = UDim2.new(1,0,1,0)
+circleBtn.BackgroundTransparency = 1
+circleBtn.Font = Enum.Font.GothamBold
+circleBtn.Text = "🤖"
+circleBtn.TextSize = 30
+circleBtn.TextColor3 = Color3.fromRGB(255,255,255)
+circleBtn.Parent = floatingCircle
+
+-- Status panel
+local statusPanel = Instance.new("Frame")
+statusPanel.Size = UDim2.new(1, -32, 0, 110)
+statusPanel.Position = UDim2.new(0, 16, 0, 64)
+statusPanel.BackgroundColor3 = Color3.fromRGB(30,40,55)
+statusPanel.BorderSizePixel = 0
+statusPanel.Parent = mainFrame
+addCorner(statusPanel, 8)
+
+local statusText = Instance.new("TextLabel")
+statusText.Size = UDim2.new(1, -20, 1, -20)
+statusText.Position = UDim2.new(0, 10, 0, 10)
+statusText.BackgroundTransparency = 1
+statusText.Font = Enum.Font.Gotham
+statusText.TextSize = 13
+statusText.TextColor3 = Color3.fromRGB(200,200,200)
+statusText.TextWrapped = true
+statusText.TextYAlignment = Enum.TextYAlignment.Top
+statusText.Text = "✅ GUI cargada\n🎯 Buscando Brainrots individuales de 50M/s+"
+statusText.Parent = statusPanel
+
+-- Filter panel
+local filterPanel = Instance.new("Frame")
+filterPanel.Size = UDim2.new(1, -32, 0, 110)
+filterPanel.Position = UDim2.new(0, 16, 0, 184)
+filterPanel.BackgroundColor3 = Color3.fromRGB(30,40,55)
+filterPanel.BorderSizePixel = 0
+filterPanel.Parent = mainFrame
+addCorner(filterPanel, 8)
+
+local filterLabel = Instance.new("TextLabel")
+filterLabel.Size = UDim2.new(1, -20, 0, 24)
+filterLabel.Position = UDim2.new(0, 10, 0, 6)
+filterLabel.BackgroundTransparency = 1
+filterLabel.Font = Enum.Font.GothamBold
+filterLabel.TextSize = 14
+filterLabel.TextColor3 = Color3.fromRGB(255,255,255)
+filterLabel.TextXAlignment = Enum.TextXAlignment.Left
+filterLabel.Text = "⚙️ FILTROS"
+filterLabel.Parent = filterPanel
+
+local sortLabel = Instance.new("TextLabel")
+sortLabel.Size = UDim2.new(0.6, 0, 0, 18)
+sortLabel.Position = UDim2.new(0, 10, 0, 35)
+sortLabel.BackgroundTransparency = 1
+sortLabel.Font = Enum.Font.Gotham
+sortLabel.TextSize = 12
+sortLabel.TextColor3 = Color3.fromRGB(200,200,200)
+sortLabel.Text = "📊 Ordenar por generación"
+sortLabel.TextXAlignment = Enum.TextXAlignment.Left
+sortLabel.Parent = filterPanel
+
+local sortToggle = Instance.new("TextButton")
+sortToggle.Size = UDim2.new(0, 56, 0, 26)
+sortToggle.Position = UDim2.new(1, -72, 0, 32)
+sortToggle.BackgroundColor3 = Color3.fromRGB(50,200,100)
+sortToggle.Text = "ON"
+sortToggle.Font = Enum.Font.GothamBold
+sortToggle.TextSize = 12
+sortToggle.Parent = filterPanel
+addCorner(sortToggle, 6)
+local sortEnabled = true
+
+local notifLabel = Instance.new("TextLabel")
+notifLabel.Size = UDim2.new(0.6,0,0,18)
+notifLabel.Position = UDim2.new(0,10,0,58)
+notifLabel.BackgroundTransparency = 1
+notifLabel.Font = Enum.Font.Gotham
+notifLabel.Text = "🔔 Notificaciones de sonido"
+notifLabel.TextSize = 12
+notifLabel.TextColor3 = Color3.fromRGB(200,200,200)
+notifLabel.TextXAlignment = Enum.TextXAlignment.Left
+notifLabel.Parent = filterPanel
+
+local notifToggle = Instance.new("TextButton")
+notifToggle.Size = UDim2.new(0,56,0,26)
+notifToggle.Position = UDim2.new(1,-72,0,56)
+notifToggle.BackgroundColor3 = Color3.fromRGB(50,200,100)
+notifToggle.Text = "ON"
+notifToggle.Font = Enum.Font.GothamBold
+notifToggle.TextSize = 12
+notifToggle.Parent = filterPanel
+addCorner(notifToggle, 6)
+local notifEnabled = true
+
+local rangeLabel = Instance.new("TextLabel")
+rangeLabel.Size = UDim2.new(1,-20,0,18)
+rangeLabel.Position = UDim2.new(0,10,0,82)
+rangeLabel.BackgroundTransparency = 1
+rangeLabel.Font = Enum.Font.Gotham
+rangeLabel.TextSize = 12
+rangeLabel.TextColor3 = Color3.fromRGB(200,200,200)
+rangeLabel.TextXAlignment = Enum.TextXAlignment.Left
+rangeLabel.Text = "🔎 Rango: Mín " .. formatNumber(MIN_GENERATION_PER_BRAINROT) .. "  Máx " .. formatNumber(MAX_GENERATION_FILTER)
+rangeLabel.Parent = filterPanel
+
+-- Buttons
+local scanBtn = Instance.new("TextButton")
+scanBtn.Size = UDim2.new(1, -32, 0, 46)
+scanBtn.Position = UDim2.new(0,16,0,306)
+scanBtn.BackgroundColor3 = Color3.fromRGB(50,150,250)
+scanBtn.Font = Enum.Font.GothamBold
+scanBtn.TextSize = 15
+scanBtn.TextColor3 = Color3.fromRGB(255,255,255)
+scanBtn.Text = "🔍 ESCANEAR SERVIDOR ACTUAL"
+scanBtn.Parent = mainFrame
+addCorner(scanBtn, 8)
+
+local exploreBtn = Instance.new("TextButton")
+exploreBtn.Size = UDim2.new(1, -32, 0, 46)
+exploreBtn.Position = UDim2.new(0,16,0,360)
+exploreBtn.BackgroundColor3 = Color3.fromRGB(50,200,100)
+exploreBtn.Font = Enum.Font.GothamBold
+exploreBtn.TextSize = 15
+exploreBtn.TextColor3 = Color3.fromRGB(255,255,255)
+exploreBtn.Text = "🚀 INICIAR EXPLORACIÓN AUTOMÁTICA"
+exploreBtn.Parent = mainFrame
+addCorner(exploreBtn, 8)
+
+local stopBtn = Instance.new("TextButton")
+stopBtn.Size = UDim2.new(1, -32, 0, 46)
+stopBtn.Position = UDim2.new(0,16,0,360)
+stopBtn.BackgroundColor3 = Color3.fromRGB(220,50,50)
+stopBtn.Font = Enum.Font.GothamBold
+stopBtn.TextSize = 15
+stopBtn.TextColor3 = Color3.fromRGB(255,255,255)
+stopBtn.Text = "⏹ DETENER EXPLORACIÓN"
+stopBtn.Visible = false
+stopBtn.Parent = mainFrame
+addCorner(stopBtn, 8)
+
+-- Results scrolling frame
+local resultsList = Instance.new("ScrollingFrame")
+resultsList.Size = UDim2.new(1, -32, 0, 210)
+resultsList.Position = UDim2.new(0,16,0,420)
+resultsList.BackgroundColor3 = Color3.fromRGB(30,40,55)
+resultsList.BorderSizePixel = 0
+resultsList.ScrollBarThickness = 6
+resultsList.ScrollBarImageColor3 = Color3.fromRGB(50,150,250)
+resultsList.CanvasSize = UDim2.new(0,0,0,0)
+resultsList.Parent = mainFrame
+addCorner(resultsList, 8)
+
+-- =========================
+-- NOTIFICACIONES
+-- =========================
+local function showNotification(message, color)
+    local notif = Instance.new("Frame")
+    notif.Size = UDim2.new(0, 420, 0, 84)
+    notif.Position = UDim2.new(1, -440, 0, 24)
+    notif.BackgroundColor3 = color or Color3.fromRGB(50,200,100)
+    notif.ZIndex = 999
+    notif.Parent = screenGui
+    addCorner(notif, 10)
+
+    local notifText = Instance.new("TextLabel")
+    notifText.Size = UDim2.new(1, -20, 1, -20)
+    notifText.Position = UDim2.new(0,10,0,10)
+    notifText.BackgroundTransparency = 1
+    notifText.Font = Enum.Font.GothamBold
+    notifText.TextSize = 14
+    notifText.TextColor3 = Color3.fromRGB(255,255,255)
+    notifText.TextWrapped = true
+    notifText.Text = message
+    notifText.Parent = notif
+
+    if notifEnabled then
+        pcall(function()
+            local s = Instance.new("Sound")
+            s.SoundId = "rbxassetid://6895079853"
+            s.Volume = 0.7
+            s.Parent = notif
+            s:Play()
+        end)
+    end
+
+    notif:TweenPosition(UDim2.new(1, -440, 0, 24), "Out", "Quad", 0.45, true)
+    task.spawn(function()
+        task.wait(5.2)
+        if notif and notif.Parent then
+            notif:TweenPosition(UDim2.new(1, -20, 0, 24), "In", "Quad", 0.45, true)
+            task.wait(0.45)
+            if notif and notif.Parent then notif:Destroy() end
+        end
+    end)
+end
+
+-- =========================
+-- ANTI-DUP y helpers
+-- =========================
+local function addUniqueBrainrot(br)
+    if not br or not br.serverId then return false end
+    for _, b in ipairs(goodBrainrots) do
+        if tostring(b.serverId) == tostring(br.serverId) then
+            return false
+        end
+    end
+    table.insert(goodBrainrots, br)
+    return true
+end
+
+-- =========================
+-- SCAN SERVER (local) - busca BillboardGui en workspace
+-- =========================
+local function scanServerLocal()
+    hopperLog("Scan", {"Escaneando workspace por BillboardGui..."})
+    statusText.Text = "🔍 Escaneando servidor actual... (buscando Brainrots " .. formatNumber(MIN_GENERATION_PER_BRAINROT) .. "/s+)"
+    local found = {}
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("BillboardGui") then
+            local hasSecret = false
+            local genText = nil
+            local nameText = nil
+
+            for _, child in ipairs(obj:GetDescendants()) do
+                if child:IsA("TextLabel") and type(child.Text) == "string" then
+                    local text = child.Text
+                    local upper = text:upper()
+
+                    if upper:find("SECRET") then hasSecret = true end
+                    if text:match("%$[%d%.]+[KMB]/s") then genText = text end
+
+                    if (not text:find("%$")) and (not upper:find("SECRET")) and (not text:find("/s")) and text:len() > 2 and text:len() < 40 then
+                        nameText = text
+                    end
+                end
+            end
+
+            if hasSecret and genText then
+                local num = tonumber(genText:match("([%d%.]+)"))
+                local generation = 0
+                if num then
+                    if genText:find("B/s") then generation = num * 1000000000
+                    elseif genText:find("M/s") then generation = num * 1000000
+                    elseif genText:find("K/s") then generation = num * 1000 end
+                end
+
+                if generation >= MIN_GENERATION_PER_BRAINROT and generation <= (MAX_GENERATION_FILTER or math.huge) then
+                    local playersCount = #Players:GetPlayers()
+                    local maxPlayers = Players.MaxPlayers or 16
+                    table.insert(found, {
+                        name = nameText or "Brainrot SECRET",
+                        generation = generation,
+                        genText = genText,
+                        serverId = tostring(game.JobId or "local"),
+                        players = tostring(playersCount) .. "/" .. tostring(maxPlayers),
+                    })
+                end
+            end
+        end
+    end
+
+    if sortEnabled and #found > 0 then
+        table.sort(found, function(a,b) return a.generation > b.generation end)
+    end
+
+    hopperLog("ScanComplete", {"Encontrados en local: " .. tostring(#found)})
+    return found
+end
+
+-- =========================
+-- OBTENER SERVIDORES (paginado)
+-- =========================
+local function fetchServersPage(cursor)
+    local url = ("https://games.roblox.com/v1/games/%s/servers/Public?sortOrder=Desc&limit=100"):format(tostring(PLACE_ID))
+    if cursor and cursor ~= "" then
+        url = url .. "&cursor=" .. tostring(cursor)
+    end
+
+    -- throttle simple
+    local now = tick()
+    if now - lastHttpRequest < throttleHttpSeconds then
+        task.wait(throttleHttpSeconds - (now - lastHttpRequest))
+    end
+    lastHttpRequest = tick()
+
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if not ok or not body then return nil, "httpfail" end
+
+    local decodeOk, data = pcall(function() return HttpService:JSONDecode(body) end)
+    if not decodeOk or not data then return nil, "decodefail" end
+
+    return data, nil
+end
+
+local function getServersList(limitTotal)
+    limitTotal = limitTotal or serversToTryLimit
+    local servers = {}
+    local cursor = nil
+    local total = 0
+
+    repeat
+        local data, err = fetchServersPage(cursor)
+        if not data then
+            hopperLog("FetchServers", {"Fallo al obtener página: " .. tostring(err)})
+            break
+        end
+
+        if type(data.data) == "table" then
+            for _, s in ipairs(data.data) do
+                if s and s.id and tostring(s.id) ~= tostring(game.JobId) then
+                    -- skip micro-servers
+                    if (s.playing or 0) >= serverSkipThresholdPlayers then
+                        if not visitedServers[tostring(s.id)] then
+                            table.insert(servers, s)
+                            visitedServers[tostring(s.id)] = true
+                            total = total + 1
+                            if total >= limitTotal then break end
+                        end
+                    end
+                end
+            end
+        end
+
+        cursor = data.nextPageCursor
+        if not cursor or cursor == "" then break end
+    until total >= limitTotal
+
+    return servers
+end
+
+-- =========================
+-- UPDATE UI (lista)
+-- =========================
+local function updateResultsList()
+    -- limpiar
+    for _, child in ipairs(resultsList:GetChildren()) do
+        if child:IsA("Frame") or child:IsA("TextLabel") or child:IsA("TextButton") then
+            child:Destroy()
+        end
+    end
+
+    if #goodBrainrots == 0 then
+        statusText.Text = "❌ No se encontraron Brainrots de 50M/s o más"
+        return
+    end
+
+    if sortEnabled then
+        table.sort(goodBrainrots, function(a,b) return a.generation > b.generation end)
+    end
+
+    local count = math.min(#goodBrainrots, displayResultsLimit)
+    for i = 1, count do
+        local br = goodBrainrots[i]
+        local entry = Instance.new("Frame")
+        entry.Size = UDim2.new(1, -12, 0, 70)
+        entry.Position = UDim2.new(0, 6, 0, (i-1)*75)
+        entry.BackgroundColor3 = Color3.fromRGB(40,50,70)
+        entry.BorderSizePixel = 0
+        entry.Parent = resultsList
+        addCorner(entry, 8)
+
+        local icon = Instance.new("TextLabel")
+        icon.Size = UDim2.new(0, 50, 0, 50)
+        icon.Position = UDim2.new(0, 8, 0, 10)
+        icon.BackgroundColor3 = Color3.fromRGB(50,60,80)
+        icon.Text = "💎"
+        icon.Font = Enum.Font.GothamBold
+        icon.TextSize = 26
+        icon.Parent = entry
+        addCorner(icon, 8)
+
+        local nameLabel = Instance.new("TextLabel")
+        nameLabel.Size = UDim2.new(1, -200, 0, 20)
+        nameLabel.Position = UDim2.new(0, 70, 0, 8)
+        nameLabel.BackgroundTransparency = 1
+        nameLabel.Text = br.name or "Brainrot"
+        nameLabel.Font = Enum.Font.GothamBold
+        nameLabel.TextSize = 13
+        nameLabel.TextColor3 = Color3.fromRGB(255,255,255)
+        nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+        nameLabel.Parent = entry
+
+        local genLabel = Instance.new("TextLabel")
+        genLabel.Size = UDim2.new(1, -200, 0, 18)
+        genLabel.Position = UDim2.new(0, 70, 0, 30)
+        genLabel.BackgroundTransparency = 1
+        genLabel.Text = "💰 " .. formatNumber(br.generation) .. "/s"
+        genLabel.Font = Enum.Font.Gotham
+        genLabel.TextSize = 12
+        genLabel.TextColor3 = Color3.fromRGB(100,255,100)
+        genLabel.TextXAlignment = Enum.TextXAlignment.Left
+        genLabel.Parent = entry
+
+        local playersLabel = Instance.new("TextLabel")
+        playersLabel.Size = UDim2.new(1, -200, 0, 16)
+        playersLabel.Position = UDim2.new(0, 70, 0, 48)
+        playersLabel.BackgroundTransparency = 1
+        playersLabel.Text = "👥 " .. (br.players or "0/??")
+        playersLabel.Font = Enum.Font.Gotham
+        playersLabel.TextSize = 11
+        playersLabel.TextColor3 = Color3.fromRGB(150,180,255)
+        playersLabel.TextXAlignment = Enum.TextXAlignment.Left
+        playersLabel.Parent = entry
+
+        local joinBtn = Instance.new("TextButton")
+        joinBtn.Size = UDim2.new(0, 92, 0, 50)
+        joinBtn.Position = UDim2.new(1, -104, 0, 10)
+        joinBtn.BackgroundColor3 = Color3.fromRGB(50,150,250)
+        joinBtn.Font = Enum.Font.GothamBold
+        joinBtn.TextSize = 14
+        joinBtn.Text = "ENTRAR"
+        joinBtn.Parent = entry
+        addCorner(joinBtn, 8)
+        joinBtn.TextColor3 = Color3.fromRGB(255,255,255)
+
+        joinBtn.MouseButton1Click:Connect(function()
+            joinBtn.Text = "⏳"
+            joinBtn.BackgroundColor3 = Color3.fromRGB(100,100,100)
+            -- Teleport con reintentos
+            task.spawn(function()
+                local tries = 0
+                local success = false
+                while tries < teleportRetryCount and not success do
+                    tries = tries + 1
+                    local ok, err = pcall(function()
+                        TeleportService:TeleportToPlaceInstance(PLACE_ID, tostring(br.serverId), player)
+                    end)
+                    if ok then success = true break end
+                    warn("Teleport fallo (intento " .. tostring(tries) .. "): " .. tostring(err))
+                    task.wait(teleportRetryDelay)
+                end
+                if not success then
+                    showNotification("❌ Falló el teleport después de varios intentos", Color3.fromRGB(220,50,50))
+                    joinBtn.Text = "ENTRAR"
+                    joinBtn.BackgroundColor3 = Color3.fromRGB(50,150,250)
+                end
+            end)
+        end)
+    end
+
+    if #goodBrainrots > displayResultsLimit then
+        local moreLabel = Instance.new("TextLabel")
+        moreLabel.Size = UDim2.new(1, -20, 0, 18)
+        moreLabel.Position = UDim2.new(0, 10, 0, displayResultsLimit*75)
+        moreLabel.BackgroundTransparency = 1
+        moreLabel.Font = Enum.Font.Gotham
+        moreLabel.TextSize = 12
+        moreLabel.TextColor3 = Color3.fromRGB(200,200,200)
+        moreLabel.Text = "... y " .. tostring(#goodBrainrots - displayResultsLimit) .. " más (ocultos para evitar lag)"
+        moreLabel.Parent = resultsList
+    end
+
+    resultsList.CanvasSize = UDim2.new(0,0,0, math.min(#goodBrainrots, displayResultsLimit)*75 + 10)
+    statusText.Text = string.format("✅ %d Brainrot(s) de %s+ encontrados", #goodBrainrots, formatNumber(MIN_GENERATION_PER_BRAINROT))
+end
+
+-- =========================
+-- ROBUST TELEPORT HELP
+-- =========================
+local function robustTeleport(placeId, serverId)
+    for attempt = 1, teleportRetryCount do
+        local ok, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(placeId, tostring(serverId), player)
+        end)
+        if ok then return true end
+        warn("Teleport intento " .. tostring(attempt) .. " fallo: " .. tostring(err))
+        task.wait(teleportRetryDelay)
+    end
+    return false
+end
+
+-- =========================
+-- START AUTO EXPLORE (usa getServersList)
+-- =========================
+local function startAutoExplore()
+    if isExploring then return end
+    isExploring = true
+    _G.HopperExploring = true
+    exploreBtn.Visible = false
+    stopBtn.Visible = true
+
+    hopperLog("Exploración", {"Iniciando exploración automática..."})
+    statusText.Text = "🔍 Escaneando servidor actual primero..."
+    task.wait(0.6)
+
+    -- scan local
+    local ok, res = pcall(scanServerLocal)
+    if ok and res and #res > 0 then
+        local added = 0
+        for _, br in ipairs(res) do
+            if addUniqueBrainrot(br) then added = added + 1 end
+        end
+        if added > 0 then
+            updateResultsList()
+            showNotification("🎉 " .. tostring(added) .. " Brainrot(s) encontrados en este servidor", Color3.fromRGB(50,200,100))
+            task.wait(1.2)
+        end
+    end
+
+    statusText.Text = "🌐 Recolectando lista de servidores públicos..."
+    local servers = getServersList(serversToTryLimit)
+    hopperLog("ServersCollected", { "Recolectados: " .. tostring(#servers) })
+
+    if #servers == 0 then
+        statusText.Text = "❌ No se pudieron obtener servidores públicos (o no hay servidores con players suficientes)."
+        isExploring = false
+        _G.HopperExploring = false
+        exploreBtn.Visible = true
+        stopBtn.Visible = false
+        return
+    end
+
+    statusText.Text = "🔎 Explorando " .. tostring(#servers) .. " servidores..."
+    task.wait(0.6)
+
+    -- intentar teleports aleatorios limitados (para eficiencia)
+    local maxAttempts = math.min(#servers, 40) -- no intentes infinitamente; ajustable
+    local order = {}
+    for i = 1, #servers do table.insert(order, servers[i]) end
+    -- mezclar para no ir siempre a los mismos índices
+    for i = #order, 2, -1 do
+        local j = math.random(1, i)
+        order[i], order[j] = order[j], order[i]
+    end
+
+    for idx = 1, maxAttempts do
+        if not isExploring then break end
+        local s = order[idx]
+        if not s or not s.id then continue end
+
+        statusText.Text = "🔁 Teleportando a servidor " .. tostring(idx) .. " / " .. tostring(maxAttempts)
+        hopperLog("TeleportTry", { "Intentando server " .. tostring(s.id) .. " (players: " .. tostring(s.playing) .. ")" })
+
+        local success = robustTeleport(PLACE_ID, s.id)
+        if success then
+            -- si teleportó, el script se suspende por el cambio de server; todo reinicia ahí
+            return
+        else
+            hopperLog("TeleportFail", { "Fallo teleport a " .. tostring(s.id) })
+            task.wait(0.6)
+        end
+    end
+
+    -- si salió del loop sin teleports válidos
+    isExploring = false
+    _G.HopperExploring = false
+    exploreBtn.Visible = true
+    stopBtn.Visible = false
+    statusText.Text = "🔍 Exploración finalizada (no se pudo conectar a servidores)."
+    hopperLog("Exploración", {"Finalizada sin teleport exitoso."})
+end
+
+-- =========================
+-- Si llegamos de teleport y HopperExploring estaba en true
+-- =========================
+if _G.HopperExploring then
+    hopperLog("PostTeleport", {"Entrando tras teleport, esperando " .. tostring(SCAN_WAIT_SECONDS) .. "s para escanear..."})
+    statusText.Text = "⏳ Cargando servidor... Esperando " .. tostring(SCAN_WAIT_SECONDS) .. "s"
+    task.wait(SCAN_WAIT_SECONDS)
+    statusText.Text = "🔍 Escaneando servidor (post-teleport)..."
+    local ok2, res2 = pcall(scanServerLocal)
+    if ok2 and res2 and #res2 > 0 then
+        local added = 0
+        for _, br in ipairs(res2) do
+            if addUniqueBrainrot(br) then added = added + 1 end
+        end
+        if added > 0 then
+            updateResultsList()
+            showNotification("🎉 " .. tostring(added) .. " Brainrot(s) detectados en este servidor", Color3.fromRGB(50,200,100))
+            task.wait(0.8)
+            -- si está activado autoJoinBest, une al mejor
+            if autoJoinBest and #goodBrainrots > 0 then
+                local best = goodBrainrots[1]
+                showNotification("🔁 Auto-join al mejor: " .. formatNumber(best.generation) .. "/s", Color3.fromRGB(50,200,100))
+                task.wait(0.6)
+                pcall(function()
+                    TeleportService:TeleportToPlaceInstance(PLACE_ID, tostring(best.serverId), player)
+                end)
+            end
+        end
+    end
+end
+
+-- =========================
+-- BOTONES y CONEXIONES
+-- =========================
+minimizeBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = false
+    floatingCircle.Visible = true
+end)
+
+circleBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = true
+    floatingCircle.Visible = false
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    isExploring = false
+    _G.HopperExploring = false
+    if screenGui and screenGui.Parent then screenGui:Destroy() end
+end)
+
+notifToggle.MouseButton1Click:Connect(function()
+    notifEnabled = not notifEnabled
+    if notifEnabled then
+        notifToggle.Text = "ON"
+        notifToggle.BackgroundColor3 = Color3.fromRGB(50,200,100)
+    else
+        notifToggle.Text = "OFF"
+        notifToggle.BackgroundColor3 = Color3.fromRGB(150,150,150)
+    end
+end)
+
+sortToggle.MouseButton1Click:Connect(function()
+    sortEnabled = not sortEnabled
+    if sortEnabled then
+        sortToggle.Text = "ON"
+        sortToggle.BackgroundColor3 = Color3.fromRGB(50,200,100)
+    else
+        sortToggle.Text = "OFF"
+        sortToggle.BackgroundColor3 = Color3.fromRGB(150,150,150)
+    end
+    updateResultsList()
+end)
+
+scanBtn.MouseButton1Click:Connect(function()
+    scanBtn.Text = "⏳ ESCANEANDO..."
+    scanBtn.BackgroundColor3 = Color3.fromRGB(100,100,100)
+    task.spawn(function()
+        local ok, localRes = pcall(scanServerLocal)
+        if ok and localRes and #localRes > 0 then
+            local added = 0
+            for _, br in ipairs(localRes) do
+                if addUniqueBrainrot(br) then added = added + 1 end
+            end
+            updateResultsList()
+            showNotification("✅ " .. tostring(added) .. " Brainrot(s) agregados", Color3.fromRGB(50,200,100))
+        else
+            showNotification("🔎 No se detectaron Brainrots nuevos en este servidor", Color3.fromRGB(200,200,50))
+        end
+        scanBtn.Text = "🔍 ESCANEAR SERVIDOR ACTUAL"
+        scanBtn.BackgroundColor3 = Color3.fromRGB(50,150,250)
+    end)
+end)
+
+exploreBtn.MouseButton1Click:Connect(function()
+    task.spawn(startAutoExplore)
+end)
+
+stopBtn.MouseButton1Click:Connect(function()
+    isExploring = false
+    _G.HopperExploring = false
+    exploreBtn.Visible = true
+    stopBtn.Visible = false
+    statusText.Text = "⏸ Exploración detenida por el usuario."
+end)
+
+-- Inicializar UI
+updateResultsList()
+hopperLog("Listo", {"Hopper PRO cargado. Usa ESCANEAR o INICIAR EXPLORACIÓN."})
