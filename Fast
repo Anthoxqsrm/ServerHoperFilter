@@ -1,0 +1,93 @@
+-- === CONFIG ===
+local MIN_GENERATION = 10_000_000 -- 10M/s
+local PLACE_ID = game.PlaceId
+
+-- === FUNCIONES ===
+
+-- Obtiene lista de servidores públicos
+local function GetServers(cursor)
+    local url = "https://games.roblox.com/v1/games/" .. PLACE_ID .. "/servers/Public?limit=100"
+    if cursor then
+        url = url .. "&cursor=" .. cursor
+    end
+    local response = game:GetService("HttpService"):JSONDecode(
+        game:HttpGet(url)
+    )
+    return response
+end
+
+-- Revisa si en el server existe al menos 1 brainrot con +10M/s
+local function ServerTieneBrainrots(serverId)
+    -- Intenta unirse al servidor **solo para inspección**
+    -- (Roblox no permite leer jugadores remotos sin entrar),
+    -- así que lo filtramos usando métodos indirectos:
+    --
+    -- Si el script original ya detecta brainrots y su generación,
+    -- después de unirse se evalúa y si no cumple se hace hop automáticamente.
+
+    return true -- dejamos pasar, ver lógica abajo
+end
+
+-- Hop a un servidor específico
+local function Join(serverId)
+    game:GetService("TeleportService"):TeleportToPlaceInstance(
+        PLACE_ID,
+        serverId,
+        game.Players.LocalPlayer
+    )
+end
+
+-- === MAIN ===
+task.spawn(function()
+    print("[HOPPER] Buscando servidores con Brainrots ≥ 10M/s...")
+
+    local cursor = nil
+
+    while true do
+        local servers = GetServers(cursor)
+
+        for _, srv in ipairs(servers.data) do
+            if srv.playing > 0 then
+                -- Entramos solo si hay jugadores; luego nuestro detector interno
+                -- verificará si hay brainrots ≥10M/s y si no, hopper automático.
+                print("[HOPPER] Probando server:", srv.id)
+                Join(srv.id)
+                return
+            end
+        end
+
+        if servers.nextPageCursor then
+            cursor = servers.nextPageCursor
+        else
+            cursor = nil
+        end
+
+        task.wait(1)
+    end
+end)
+
+-- === Dentro del juego, cuando cargue ===
+-- Esto reemplaza tu “buscador de brainrots”
+task.spawn(function()
+    task.wait(5)
+
+    local function BuscarBrainrots()
+        for _, p in ipairs(game.Players:GetPlayers()) do
+            if p:FindFirstChild("BrainrotStats") then
+                local gen = p.BrainrotStats.Generation.Value or 0
+                if gen >= MIN_GENERATION then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
+    if not BuscarBrainrots() then
+        warn("[HOPPER] No hay brainrots ≥10M/s, cambiando de servidor...")
+        task.wait(1)
+        game:GetService("TeleportService"):Teleport(game.PlaceId, game.Players.LocalPlayer)
+    else
+        print("[HOPPER] ¡Servidor válido! Hay brainrots ≥10M/s")
+    end
+end)
